@@ -17,6 +17,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className="min-h-screen">
         <ClerkProvider
+          telemetry={false}
           appearance={{
             variables: {
               colorBackground: "var(--surface)",

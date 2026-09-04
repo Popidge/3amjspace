@@ -34,19 +34,30 @@ export default defineSchema({
     userId: v.id("users"),
     handle: v.string(),
     bio: v.string(),
+    displayName: v.optional(v.string()),
+    avatarStorageId: v.optional(v.id("_storage")),
+    githubUrl: v.optional(v.string()),
     role: v.union(v.literal("member"), v.literal("moderator")),
     status: v.union(v.literal("active"), v.literal("suspended")),
   })
     .index("by_userId", ["userId"])
     .index("by_handle", ["handle"])
     .index("by_role", ["role"]),
+  profileLinks: defineTable({
+    profileId: v.id("profiles"),
+    label: v.string(),
+    url: v.string(),
+    order: v.number(),
+  }).index("by_profileId", ["profileId"]),
   threads: defineTable({
     board,
+    slug: v.optional(v.string()),
     title: v.string(),
     body: v.string(),
     authorId: v.id("users"),
     status: v.union(v.literal("draft"), v.literal("published")),
     imageStorageId: v.optional(v.id("_storage")),
+    imageAltText: v.optional(v.string()),
     projectUrl: v.optional(v.string()),
     replyCount: v.number(),
     lastActivityAt: v.number(),
@@ -58,6 +69,7 @@ export default defineSchema({
     moderationCheckedAt: v.optional(v.number()),
     moderationCategories: v.optional(v.array(v.string())),
   })
+    .index("by_slug", ["slug"])
     .index("by_board", ["board"])
     .index("by_board_and_status", ["board", "status"])
     .index("by_authorId", ["authorId"]),
@@ -101,6 +113,18 @@ export default defineSchema({
     action: v.union(v.literal("hide"), v.literal("restore")),
     reason: v.string(),
   }).index("by_moderatorId", ["moderatorId"]),
+  reports: defineTable({
+    reporterId: v.id("users"),
+    targetType: v.union(v.literal("thread"), v.literal("reply")),
+    targetId: v.string(),
+    reason: v.string(),
+    status: v.union(v.literal("open"), v.literal("resolved")),
+    resolvedBy: v.optional(v.id("users")),
+    resolvedAt: v.optional(v.number()),
+  })
+    .index("by_status", ["status"])
+    .index("by_targetId", ["targetId"])
+    .index("by_reporterId_and_targetId", ["reporterId", "targetId"]),
   moderationAttempts: defineTable({
     submissionId: v.string(),
     userId: v.id("users"),

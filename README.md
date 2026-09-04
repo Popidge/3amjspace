@@ -25,6 +25,7 @@ Requirements: Node.js 20 or newer and pnpm 10.
    ```sh
    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
    CLERK_SECRET_KEY=sk_test_...
+   NEXT_PUBLIC_CLERK_TELEMETRY_DISABLED=1
    ```
 
 6. Copy the Clerk Frontend API URL to the Convex development deployment:
@@ -51,6 +52,8 @@ pnpm lint
 pnpm build
 npx convex dev --once
 ```
+
+Read the [privacy and cookie audit](docs/privacy-audit.md) and [accessibility review](docs/accessibility-review.md) before a production release. Configure and test `privacy@3amj.space` before publishing the privacy notice.
 
 ## Production on Vercel and Convex
 
@@ -102,12 +105,23 @@ Generate a production deploy key in the Convex deployment settings. Give it the
    - `CONVEX_DEPLOY_KEY`: the production deploy key from Convex.
    - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`: the Clerk `pk_live_` key.
    - `CLERK_SECRET_KEY`: the Clerk `sk_live_` key.
+   - `NEXT_PUBLIC_CLERK_TELEMETRY_DISABLED`: set this to `1`.
 5. Do not set `NEXT_PUBLIC_CONVEX_URL`. The build command in `vercel.json`
    injects the URL for the Convex deployment selected by `CONVEX_DEPLOY_KEY`.
 6. Deploy the project.
 
 The first production deploy does not seed accounts, threads, projects, or
 featured items.
+
+If the production deployment already contains threads, generate their readable
+routes after this feature deploys:
+
+```sh
+npx convex run --prod forum:backfillThreadSlugs '{}'
+```
+
+The function processes 100 threads per transaction. It schedules another
+transaction when more threads remain.
 
 ### 4. Connect the public domain
 
@@ -159,6 +173,7 @@ The function is internal and cannot be called from the web app. Pass
 | Vercel | `CONVEX_DEPLOY_KEY` | Selects and deploys the production Convex backend during the build |
 | Vercel | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Identifies the production Clerk instance in the browser |
 | Vercel | `CLERK_SECRET_KEY` | Gives the Next.js server access to the production Clerk instance |
+| Vercel | `NEXT_PUBLIC_CLERK_TELEMETRY_DISABLED` | Disables Clerk SDK telemetry |
 | Convex production | `OPENAI_API_KEY` | Text and project-image content-safety checks |
 | Convex production | `CLERK_JWT_ISSUER_DOMAIN` | Lets Convex validate Clerk session tokens |
 

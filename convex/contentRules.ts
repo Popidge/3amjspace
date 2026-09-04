@@ -30,6 +30,7 @@ export type ThreadContentInput = {
   metadata: ProjectMetadataInput[];
   projectUrl?: string;
   tags?: string[];
+  imageAltText?: string;
 };
 
 export type NormalizedThreadContent = {
@@ -38,6 +39,7 @@ export type NormalizedThreadContent = {
   metadata: ProjectMetadataInput[];
   projectUrl?: string;
   tags: string[];
+  imageAltText?: string;
 };
 
 function normalizeProjectUrl(value: string | undefined) {
@@ -94,10 +96,11 @@ export function normalizeThreadContent(input: ThreadContentInput): NormalizedThr
     .filter((item) => item.key && item.value);
   const projectUrl = normalizeProjectUrl(input.projectUrl);
   const tags = normalizeProjectTags(input.tags);
-  if (input.board !== "projects" && (metadata.length > 0 || projectUrl !== undefined || tags.length > 0)) {
+  const imageAltText = input.imageAltText?.trim().slice(0, 280) || undefined;
+  if (input.board !== "projects" && (metadata.length > 0 || projectUrl !== undefined || tags.length > 0 || imageAltText !== undefined)) {
     throw new Error("Only project threads can have links, tags, or project details.");
   }
-  return { title, body, metadata, projectUrl, tags };
+  return { title, body, metadata, projectUrl, tags, imageAltText };
 }
 
 export function normalizeReplyBody(value: string) {
@@ -111,6 +114,7 @@ export function normalizeReplyBody(value: string) {
 export function buildThreadModerationText(content: NormalizedThreadContent) {
   const parts = [`Thread title:\n${content.title}`, `Post:\n${content.body}`];
   if (content.projectUrl) parts.push(`Project link:\n${content.projectUrl}`);
+  if (content.imageAltText) parts.push(`Project image description:\n${content.imageAltText}`);
   if (content.tags.length > 0) parts.push(`Tags:\n${content.tags.join(", ")}`);
   if (content.metadata.length > 0) {
     parts.push(`Project details:\n${content.metadata.map((item) => `${item.key}: ${item.value}`).join("\n")}`);

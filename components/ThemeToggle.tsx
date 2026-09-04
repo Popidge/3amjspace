@@ -1,6 +1,7 @@
 "use client";
 
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Monitor, Moon, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useSyncExternalStore } from "react";
 
@@ -17,9 +18,9 @@ export function ThemeToggle() {
       value={mounted ? (theme ?? "") : ""}
       aria-label="Appearance"
     >
-      <ToggleGroupItem value="light" aria-label="Use light appearance">Light</ToggleGroupItem>
-      <ToggleGroupItem value="dark" aria-label="Use dark appearance">Dark</ToggleGroupItem>
-      <ToggleGroupItem value="system" aria-label="Follow system appearance">System</ToggleGroupItem>
+      <ToggleGroupItem value="light" aria-label="Use light appearance" title="Light appearance"><Sun /></ToggleGroupItem>
+      <ToggleGroupItem value="dark" aria-label="Use dark appearance" title="Dark appearance"><Moon /></ToggleGroupItem>
+      <ToggleGroupItem value="system" aria-label="Follow system appearance" title="Follow system appearance"><Monitor /></ToggleGroupItem>
     </ToggleGroup>
   );
 }

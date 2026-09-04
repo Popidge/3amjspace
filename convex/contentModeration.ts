@@ -21,8 +21,9 @@ const MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 8_000;
 
 const terminalStatusValidator = v.union(v.literal("approved"), v.literal("rejected"));
-const threadResultValidator = v.object({ threadId: v.id("threads"), status: terminalStatusValidator });
+const threadResultValidator = v.object({ threadId: v.id("threads"), slug: v.optional(v.string()), status: terminalStatusValidator });
 const replyResultValidator = v.object({ replyId: v.id("replies"), status: terminalStatusValidator });
+const profileLinkValidator = v.object({ label: v.string(), url: v.string() });
 
 const threadContentArgs = {
   title: v.string(),
@@ -31,10 +32,11 @@ const threadContentArgs = {
   imageStorageId: v.optional(v.id("_storage")),
   projectUrl: v.optional(v.string()),
   tags: v.optional(v.array(v.string())),
+  imageAltText: v.optional(v.string()),
 };
 
 type ModerationOutcome = { flagged: boolean; categories: string[]; model: string };
-type ThreadActionResult = { threadId: Id<"threads">; status: "approved" | "rejected" };
+type ThreadActionResult = { threadId: Id<"threads">; slug?: string; status: "approved" | "rejected" };
 type ReplyActionResult = { replyId: Id<"replies">; status: "approved" | "rejected" };
 
 class ModerationServiceError extends Error {
@@ -185,8 +187,8 @@ export const createThread = action({
         model: outcome.model,
         safeContent: outcome.flagged ? undefined : content,
       });
-      if (!applied) throw new ModerationServiceError("attempt_stale", false);
-      return { threadId: pending.threadId, status: outcome.flagged ? "rejected" : "approved" };
+      if (!applied.applied) throw new ModerationServiceError("attempt_stale", false);
+      return { threadId: pending.threadId, ...(applied.slug === undefined ? {} : { slug: applied.slug }), status: outcome.flagged ? "rejected" : "approved" };
     } catch (error) {
       await recordAttemptFailure(ctx, pending.attemptId, pending.attemptCount, error);
       throw unavailableError();
@@ -232,8 +234,8 @@ export const updateThread = action({
         model: outcome.model,
         safeContent: outcome.flagged ? undefined : content,
       });
-      if (!applied) throw new ModerationServiceError("attempt_stale", false);
-      return { threadId: pending.threadId, status: outcome.flagged ? "rejected" : "approved" };
+      if (!applied.applied) throw new ModerationServiceError("attempt_stale", false);
+      return { threadId: pending.threadId, ...(applied.slug === undefined ? {} : { slug: applied.slug }), status: outcome.flagged ? "rejected" : "approved" };
     } catch (error) {
       await recordAttemptFailure(ctx, pending.attemptId, pending.attemptCount, error);
       throw unavailableError();
@@ -299,6 +301,83 @@ export const updateReply = action({
     } catch (error) {
       await recordAttemptFailure(ctx, pending.attemptId, pending.attemptCount, error);
       throw unavailableError();
+    }
+  },
+});
+
+export const ensureProfile = action({
+  args: { handle: v.string(), bio: v.optional(v.string()) },
+  returns: v.id("profiles"),
+  handler: async (ctx, args): Promise<Id<"profiles">> => {
+    const userId = await requireActionUser(ctx);
+    if (args.handle.length > 64 || (args.bio?.length ?? 0) > 280) throw new Error("Profile details are too long.");
+    let outcome: ModerationOutcome;
+    try {
+      outcome = await classifyContent(`Profile handle:\n${args.handle}\n\nBio:\n${args.bio ?? ""}`, null);
+    } catch {
+      throw new Error("The profile safety check is temporarily unavailable. Try again shortly.");
+    }
+    if (outcome.flagged) throw new Error("The profile was not created because its public content did not pass the safety check.");
+    return await ctx.runMutation(internal.forum.applyProfileSetup, { userId, ...args });
+  },
+});
+
+export const updateProfile = action({
+  args: {
+    handle: v.string(),
+    displayName: v.string(),
+    bio: v.string(),
+    githubUrl: v.string(),
+    socialLinks: v.array(profileLinkValidator),
+    avatarStorageId: v.optional(v.id("_storage")),
+    removeAvatar: v.boolean(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args): Promise<null> => {
+    const userId = await requireActionUser(ctx);
+    if (args.handle.length > 64 || args.displayName.length > 80 || args.bio.length > 280 || args.githubUrl.length > 2048) {
+      throw new Error("Profile details are too long.");
+    }
+    if (args.socialLinks.length > 3 || args.socialLinks.some((link) => link.label.length > 24 || link.url.length > 2048)) {
+      throw new Error("Profiles can have up to three short links.");
+    }
+    const text = [
+      `Profile handle:\n${args.handle}`,
+      `Display name:\n${args.displayName}`,
+      `Bio:\n${args.bio}`,
+      `GitHub:\n${args.githubUrl}`,
+      ...args.socialLinks.map((link) => `Profile link:\n${link.label}: ${link.url}`),
+    ].join("\n\n");
+    let imageUrl: string | null = null;
+    if (args.avatarStorageId !== undefined) {
+      try {
+        imageUrl = await ctx.runQuery(internal.forum.getProfileImageUrlForModeration, { userId, imageStorageId: args.avatarStorageId });
+      } catch (error) {
+        try { await ctx.runMutation(internal.forum.discardProfileImage, { userId, imageStorageId: args.avatarStorageId }); } catch { /* The storage cleanup can be retried by an operator. */ }
+        throw error;
+      }
+    }
+    let outcome: ModerationOutcome;
+    try {
+      outcome = await classifyContent(text, imageUrl);
+    } catch {
+      if (args.avatarStorageId !== undefined) {
+        try { await ctx.runMutation(internal.forum.discardProfileImage, { userId, imageStorageId: args.avatarStorageId }); } catch { /* The storage cleanup can be retried by an operator. */ }
+      }
+      throw new Error("The profile safety check is temporarily unavailable. Try again without uploading another image.");
+    }
+    if (outcome.flagged) {
+      if (args.avatarStorageId !== undefined) await ctx.runMutation(internal.forum.discardProfileImage, { userId, imageStorageId: args.avatarStorageId });
+      throw new Error("The profile was not updated because its public content did not pass the safety check.");
+    }
+    try {
+      await ctx.runMutation(internal.forum.applyProfileUpdate, { userId, ...args });
+      return null;
+    } catch (error) {
+      if (args.avatarStorageId !== undefined) {
+        try { await ctx.runMutation(internal.forum.discardProfileImage, { userId, imageStorageId: args.avatarStorageId }); } catch { /* The storage cleanup can be retried by an operator. */ }
+      }
+      throw error;
     }
   },
 });
