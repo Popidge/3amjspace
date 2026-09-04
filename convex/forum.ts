@@ -16,9 +16,60 @@ const approvedThreadContentValidator = v.object({
   metadata: v.array(metadataValidator),
   projectUrl: v.optional(v.string()),
   tags: v.array(v.string()),
+  imageAltText: v.optional(v.string()),
 });
 
 const terminalModerationStatusValidator = v.union(v.literal("approved"), v.literal("rejected"));
+const profileLinkResultValidator = v.object({
+  label: v.string(),
+  url: v.string(),
+});
+const publicThreadResultValidator = v.object({
+  _id: v.id("threads"),
+  slug: v.optional(v.string()),
+  board: boardValidator,
+  title: v.string(),
+  replyCount: v.number(),
+  lastActivityAt: v.number(),
+});
+const publicProfileResultValidator = v.union(v.null(), v.object({
+  handle: v.string(),
+  displayName: v.optional(v.string()),
+  bio: v.string(),
+  githubUrl: v.optional(v.string()),
+  avatarUrl: v.union(v.string(), v.null()),
+  links: v.array(profileLinkResultValidator),
+  threads: v.array(publicThreadResultValidator),
+}));
+const viewerResultValidator = v.union(v.null(), v.object({
+  user: v.union(v.null(), v.object({
+    _id: v.id("users"),
+    email: v.optional(v.string()),
+    name: v.optional(v.string()),
+  })),
+  profile: v.union(v.null(), v.object({
+    handle: v.string(),
+    displayName: v.optional(v.string()),
+    bio: v.string(),
+    githubUrl: v.optional(v.string()),
+    avatarUrl: v.union(v.string(), v.null()),
+    links: v.array(profileLinkResultValidator),
+    role: v.union(v.literal("member"), v.literal("moderator")),
+    status: v.union(v.literal("active"), v.literal("suspended")),
+  })),
+}));
+const openReportResultValidator = v.object({
+  _id: v.id("reports"),
+  _creationTime: v.number(),
+  reporterId: v.id("users"),
+  targetType: v.union(v.literal("thread"), v.literal("reply")),
+  targetId: v.string(),
+  reason: v.string(),
+  status: v.literal("open"),
+  reporterHandle: v.string(),
+  context: v.string(),
+  threadId: v.union(v.id("threads"), v.null()),
+});
 
 const beginThreadModerationResultValidator = v.union(
   v.object({
@@ -34,6 +85,7 @@ const beginThreadModerationResultValidator = v.union(
     state: v.literal("complete"),
     threadId: v.id("threads"),
     status: terminalModerationStatusValidator,
+    slug: v.optional(v.string()),
   }),
   v.object({ state: v.literal("pending"), threadId: v.id("threads") }),
 );
@@ -124,6 +176,30 @@ function cleanHandle(value: string) {
   return value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 24);
 }
 
+function cleanProfileUrl(value: string, kind: "github" | "social") {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Profile links must be valid HTTPS URLs.");
+  }
+  if (parsed.protocol !== "https:") throw new Error("Profile links must use HTTPS.");
+  if (kind === "github" && parsed.hostname !== "github.com" && parsed.hostname !== "www.github.com") {
+    throw new Error("The GitHub link must point to github.com.");
+  }
+  return parsed.toString().slice(0, 2048);
+}
+
+async function validateProfileImage(ctx: QueryCtx | MutationCtx, imageStorageId: Id<"_storage"> | undefined) {
+  if (imageStorageId === undefined) return;
+  const metadata = await ctx.db.system.get("_storage", imageStorageId);
+  if (metadata === null) throw new Error("That profile image was not found.");
+  if (!metadata.contentType?.startsWith("image/")) throw new Error("Profile uploads must be image files.");
+  if (metadata.size > MAX_PROJECT_IMAGE_BYTES) throw new Error("Profile images must be 5 MB or smaller.");
+}
+
 async function validateProjectImage(ctx: MutationCtx, imageStorageId: Id<"_storage"> | undefined) {
   if (imageStorageId === undefined) return;
   const metadata = await ctx.db.system.get("_storage", imageStorageId);
@@ -141,8 +217,44 @@ async function deleteProjectImageIfPresent(ctx: MutationCtx, imageStorageId: Id<
   if (metadata !== null) await ctx.storage.delete(imageStorageId);
 }
 
+async function deleteReportsForTarget(ctx: MutationCtx, targetId: string) {
+  const reports = await ctx.db.query("reports").withIndex("by_targetId", (q) => q.eq("targetId", targetId)).take(100);
+  for (const report of reports) await ctx.db.delete("reports", report._id);
+  return reports.length === 100;
+}
+
 function isSafetyApproved(status: "pending" | "approved" | "rejected" | "error" | undefined) {
   return status === undefined || status === "approved";
+}
+
+function threadSlugBase(title: string) {
+  const titlePart = title
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/-+$/g, "");
+  return `post-${titlePart || "untitled"}`;
+}
+
+async function makeUniqueThreadSlug(ctx: MutationCtx, title: string, threadId: Id<"threads">) {
+  const base = threadSlugBase(title);
+  for (const suffixLength of [4, 6, 8]) {
+    const candidate = `${base}-${threadId.slice(-suffixLength)}`;
+    const existing = await ctx.db.query("threads").withIndex("by_slug", (q) => q.eq("slug", candidate)).unique();
+    if (existing === null || existing._id === threadId) return candidate;
+  }
+  return `${base}-${threadId}`;
+}
+
+async function getThreadByRouteKey(ctx: QueryCtx, routeKey: string) {
+  const normalizedKey = routeKey.trim().toLowerCase();
+  if (normalizedKey.length === 0 || normalizedKey.length > 100) return null;
+  const threadId = ctx.db.normalizeId("threads", normalizedKey);
+  if (threadId !== null) return await ctx.db.get("threads", threadId);
+  return await ctx.db.query("threads").withIndex("by_slug", (q) => q.eq("slug", normalizedKey)).unique();
 }
 
 async function latestApprovedReplyTime(ctx: MutationCtx, threadId: Id<"threads">, fallback: number) {
@@ -219,6 +331,7 @@ async function setAttemptError(
         title: "[safety check unavailable]",
         body: "",
         imageStorageId: undefined,
+        imageAltText: undefined,
         projectUrl: undefined,
         moderationStatus: "error",
       });
@@ -262,14 +375,30 @@ async function setAttemptError(
 
 export const getViewer = query({
   args: {},
-  returns: v.any(),
+  returns: viewerResultValidator,
   handler: async (ctx) => {
     const identity = await ctx.auth.getUserIdentity();
     if (identity === null) return null;
     const user = await getUserByTokenIdentifier(ctx, identity.tokenIdentifier);
     if (user === null) return { user: null, profile: null };
     const profile = await getProfile(ctx, user._id);
-    return { user, profile };
+    const viewerUser = { _id: user._id, email: user.email, name: user.name };
+    if (profile === null) return { user: viewerUser, profile: null };
+    const avatarUrl = profile.avatarStorageId === undefined ? null : await ctx.storage.getUrl(profile.avatarStorageId);
+    const links = await ctx.db.query("profileLinks").withIndex("by_profileId", (q) => q.eq("profileId", profile._id)).order("asc").take(3);
+    return {
+      user: viewerUser,
+      profile: {
+        handle: profile.handle,
+        displayName: profile.displayName,
+        bio: profile.bio,
+        githubUrl: profile.githubUrl,
+        avatarUrl,
+        links: links.map(({ label, url }) => ({ label, url })),
+        role: profile.role,
+        status: profile.status,
+      },
+    };
   },
 });
 
@@ -291,29 +420,33 @@ export const generateProjectImageUploadUrl = mutation({
   },
 });
 
+export const generateProfileImageUploadUrl = mutation({
+  args: {},
+  returns: v.string(),
+  handler: async (ctx) => {
+    await requireMember(ctx);
+    return await ctx.storage.generateUploadUrl();
+  },
+});
+
 export const storeViewer = mutation({
   args: {},
   returns: v.id("users"),
   handler: async (ctx) => await storeCurrentUser(ctx),
 });
 
-export const ensureProfile = mutation({
-  args: { handle: v.string(), bio: v.optional(v.string()) },
+export const applyProfileSetup = internalMutation({
+  args: { userId: v.id("users"), handle: v.string(), bio: v.optional(v.string()) },
   returns: v.id("profiles"),
   handler: async (ctx, args) => {
-    const identity = await ctx.auth.getUserIdentity();
-    if (identity === null) throw new Error("Sign in first.");
-    let user = await getUserByTokenIdentifier(ctx, identity.tokenIdentifier);
-    if (user !== null) {
-      const existing = await getProfile(ctx, user._id);
-      if (existing !== null) return existing._id;
-    }
+    const user = await ctx.db.get("users", args.userId);
+    if (user === null) throw new Error("Sign in first.");
+    const existingProfile = await getProfile(ctx, user._id);
+    if (existingProfile !== null) return existingProfile._id;
     const handle = cleanHandle(args.handle);
     if (handle.length < 2) throw new Error("Use at least two letters or numbers.");
     const taken = await ctx.db.query("profiles").withIndex("by_handle", (q) => q.eq("handle", handle)).unique();
     if (taken !== null) throw new Error("That handle is already taken.");
-    if (user === null) user = await ctx.db.get("users", await storeCurrentUser(ctx));
-    if (user === null) throw new Error("Could not create your local account.");
     const existing = await getProfile(ctx, user._id);
     if (existing !== null) return existing._id;
     return await ctx.db.insert("profiles", {
@@ -351,19 +484,103 @@ export const setModeratorByEmail = internalMutation({
   },
 });
 
-export const updateProfile = mutation({
-  args: { handle: v.string(), bio: v.string() },
+export const applyProfileUpdate = internalMutation({
+  args: {
+    userId: v.id("users"),
+    handle: v.string(),
+    displayName: v.string(),
+    bio: v.string(),
+    githubUrl: v.string(),
+    socialLinks: v.array(v.object({ label: v.string(), url: v.string() })),
+    avatarStorageId: v.optional(v.id("_storage")),
+    removeAvatar: v.boolean(),
+  },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const { userId, profile } = await requireMember(ctx);
+    const profile = await requireMemberById(ctx, args.userId);
     const handle = cleanHandle(args.handle);
     if (handle.length < 2) throw new Error("Use at least two letters or numbers.");
     if (handle !== profile.handle) {
       const taken = await ctx.db.query("profiles").withIndex("by_handle", (q) => q.eq("handle", handle)).unique();
-      if (taken !== null && taken.userId !== userId) throw new Error("That handle is already taken.");
+      if (taken !== null && taken.userId !== args.userId) throw new Error("That handle is already taken.");
     }
-    await ctx.db.patch("profiles", profile._id, { handle, bio: args.bio.trim().slice(0, 280) });
+    if (args.socialLinks.length > 3) throw new Error("Profiles can have up to three social links.");
+    if (args.avatarStorageId !== undefined && args.removeAvatar) throw new Error("Choose a new profile image or remove the old one, not both.");
+    await validateProfileImage(ctx, args.avatarStorageId);
+    const links = args.socialLinks
+      .map((link) => ({ label: link.label.trim().slice(0, 24), url: cleanProfileUrl(link.url, "social") }))
+      .filter((link): link is { label: string; url: string } => Boolean(link.label && link.url));
+    const oldLinks = await ctx.db.query("profileLinks").withIndex("by_profileId", (q) => q.eq("profileId", profile._id)).take(4);
+    for (const link of oldLinks) await ctx.db.delete("profileLinks", link._id);
+    for (const [order, link] of links.entries()) await ctx.db.insert("profileLinks", { profileId: profile._id, ...link, order });
+    const nextAvatarStorageId = args.avatarStorageId ?? (args.removeAvatar ? undefined : profile.avatarStorageId);
+    if (profile.avatarStorageId !== undefined && profile.avatarStorageId !== nextAvatarStorageId) {
+      await deleteProjectImageIfPresent(ctx, profile.avatarStorageId);
+    }
+    await ctx.db.patch("profiles", profile._id, {
+      handle,
+      displayName: args.displayName.trim().slice(0, 80) || undefined,
+      bio: args.bio.trim().slice(0, 280),
+      githubUrl: cleanProfileUrl(args.githubUrl, "github"),
+      avatarStorageId: nextAvatarStorageId,
+    });
     return null;
+  },
+});
+
+export const discardProfileImage = internalMutation({
+  args: { userId: v.id("users"), imageStorageId: v.id("_storage") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await requireMemberById(ctx, args.userId);
+    await deleteProjectImageIfPresent(ctx, args.imageStorageId);
+    return null;
+  },
+});
+
+export const getProfileImageUrlForModeration = internalQuery({
+  args: { userId: v.id("users"), imageStorageId: v.id("_storage") },
+  returns: v.string(),
+  handler: async (ctx, args) => {
+    const profile = await getProfile(ctx, args.userId);
+    if (profile === null || profile.status !== "active") throw new Error("Active profile required.");
+    await validateProfileImage(ctx, args.imageStorageId);
+    const imageUrl = await ctx.storage.getUrl(args.imageStorageId);
+    if (imageUrl === null) throw new Error("That profile image was not found.");
+    return imageUrl;
+  },
+});
+
+export const getPublicProfile = query({
+  args: { handle: v.string() },
+  returns: publicProfileResultValidator,
+  handler: async (ctx, args) => {
+    const handle = cleanHandle(args.handle);
+    const profile = await ctx.db.query("profiles").withIndex("by_handle", (q) => q.eq("handle", handle)).unique();
+    if (profile === null || profile.status !== "active") return null;
+    const links = await ctx.db.query("profileLinks").withIndex("by_profileId", (q) => q.eq("profileId", profile._id)).order("asc").take(3);
+    const avatarUrl = profile.avatarStorageId === undefined ? null : await ctx.storage.getUrl(profile.avatarStorageId);
+    const threadRows = await ctx.db.query("threads").withIndex("by_authorId", (q) => q.eq("authorId", profile.userId)).order("desc").take(100);
+    const threads = threadRows
+      .filter((thread) => thread.status === "published" && thread.hiddenAt === undefined && isSafetyApproved(thread.moderationStatus))
+      .slice(0, 50)
+      .map((thread) => ({
+        _id: thread._id,
+        slug: thread.slug,
+        board: thread.board,
+        title: thread.title,
+        replyCount: thread.replyCount,
+        lastActivityAt: thread.lastActivityAt,
+      }));
+    return {
+      handle: profile.handle,
+      displayName: profile.displayName,
+      bio: profile.bio,
+      githubUrl: profile.githubUrl,
+      avatarUrl,
+      links: links.map(({ label, url }) => ({ label, url })),
+      threads,
+    };
   },
 });
 
@@ -466,10 +683,10 @@ export const listRecent = query({
 });
 
 export const getThread = query({
-  args: { threadId: v.id("threads") },
+  args: { routeKey: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {
-    const thread = await ctx.db.get("threads", args.threadId);
+    const thread = await getThreadByRouteKey(ctx, args.routeKey);
     if (thread === null) return null;
     const viewerId = await getCurrentUserId(ctx);
     const viewerProfile = viewerId === null ? null : await getProfile(ctx, viewerId);
@@ -478,6 +695,7 @@ export const getThread = query({
     if (!isSafetyApproved(thread.moderationStatus) && thread.authorId !== viewerId && !canModerate) return null;
     const safetyApproved = isSafetyApproved(thread.moderationStatus);
     const author = await getProfile(ctx, thread.authorId);
+    const authorAvatarUrl = author?.avatarStorageId === undefined ? null : await ctx.storage.getUrl(author.avatarStorageId);
     const metadata = safetyApproved
       ? await ctx.db.query("projectMetadata").withIndex("by_threadId", (q) => q.eq("threadId", thread._id)).order("asc").take(6)
       : [];
@@ -516,6 +734,7 @@ export const getThread = query({
       body: thread.hiddenAt ? "[This thread was removed by a moderator.]" : safetyApproved ? thread.body : "",
       projectUrl: safetyApproved ? thread.projectUrl : undefined,
       authorHandle: author?.handle ?? "unknown",
+      authorAvatarUrl,
       metadata,
       tags: tagRows.map((row) => row.tag),
       imageUrl,
@@ -573,6 +792,7 @@ export const beginCreateThread = internalMutation({
         title: "[awaiting safety check]",
         body: "",
         imageStorageId: undefined,
+        imageAltText: undefined,
         projectUrl: undefined,
         moderationStatus: "pending",
         moderationRevision: revision,
@@ -740,7 +960,7 @@ export const finishThreadModeration = internalMutation({
     model: v.string(),
     safeContent: v.optional(approvedThreadContentValidator),
   },
-  returns: v.boolean(),
+  returns: v.object({ applied: v.boolean(), slug: v.optional(v.string()) }),
   handler: async (ctx, args) => {
     const attempt = await ctx.db.get("moderationAttempts", args.attemptId);
     const thread = await ctx.db.get("threads", args.threadId);
@@ -754,7 +974,7 @@ export const finishThreadModeration = internalMutation({
       thread.moderationStatus !== "pending" ||
       thread.moderationRevision !== args.revision
     ) {
-      return false;
+      return { applied: false };
     }
     const candidateImageStorageId = attempt.imageStorageId;
     const removeImage = attempt.removeImage ?? false;
@@ -785,19 +1005,22 @@ export const finishThreadModeration = internalMutation({
         imageStorageId: undefined,
         errorCode: undefined,
       });
-      return true;
+      return { applied: true, ...(thread.slug === undefined ? {} : { slug: thread.slug }) };
     }
     if (args.safeContent === undefined) throw new Error("Approved moderation requires safe content.");
     const nextImageStorageId = candidateImageStorageId ?? (removeImage ? undefined : thread.imageStorageId);
     if (thread.imageStorageId !== undefined && thread.imageStorageId !== nextImageStorageId) {
       await deleteProjectImageIfPresent(ctx, thread.imageStorageId);
     }
+    const slug = thread.slug ?? await makeUniqueThreadSlug(ctx, args.safeContent.title, thread._id);
     await ctx.db.patch("threads", thread._id, {
+      slug,
       title: args.safeContent.title,
       body: args.safeContent.body,
       ...(thread.board === "projects" ? {
         projectUrl: args.safeContent.projectUrl,
         imageStorageId: nextImageStorageId,
+        imageAltText: nextImageStorageId === undefined ? undefined : args.safeContent.imageAltText,
       } : {}),
       moderationStatus: "approved",
       moderationModel: args.model,
@@ -813,7 +1036,29 @@ export const finishThreadModeration = internalMutation({
       imageStorageId: undefined,
       errorCode: undefined,
     });
-    return true;
+    return { applied: true, slug };
+  },
+});
+
+export const backfillThreadSlugs = internalMutation({
+  args: { cursor: v.optional(v.string()) },
+  returns: v.object({ updated: v.number(), isDone: v.boolean() }),
+  handler: async (ctx, args): Promise<{ updated: number; isDone: boolean }> => {
+    const page = await ctx.db.query("threads").order("asc").paginate({
+      cursor: args.cursor ?? null,
+      numItems: 100,
+    });
+    let updated = 0;
+    for (const thread of page.page) {
+      if (thread.slug !== undefined || !isSafetyApproved(thread.moderationStatus)) continue;
+      const slug = await makeUniqueThreadSlug(ctx, thread.title, thread._id);
+      await ctx.db.patch("threads", thread._id, { slug });
+      updated += 1;
+    }
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.forum.backfillThreadSlugs, { cursor: page.continueCursor });
+    }
+    return { updated, isDone: page.isDone };
   },
 });
 
@@ -1056,7 +1301,9 @@ export const deleteReply = mutation({
       if (attempt.imageStorageId !== undefined) await deleteProjectImageIfPresent(ctx, attempt.imageStorageId);
       await ctx.db.delete("moderationAttempts", attempt._id);
     }
+    const moreReports = await deleteReportsForTarget(ctx, replyDoc._id);
     await ctx.db.delete("replies", replyDoc._id);
+    if (moreReports) await ctx.scheduler.runAfter(0, internal.forum.cleanupReportsForTarget, { targetId: replyDoc._id });
     if (thread !== null && isSafetyApproved(replyDoc.moderationStatus)) {
       await ctx.db.patch("threads", thread._id, {
         replyCount: Math.max(0, thread.replyCount - 1),
@@ -1083,13 +1330,17 @@ export const deleteThread = mutation({
     const attempts = await ctx.db.query("moderationAttempts").withIndex("by_threadId", (q) => q.eq("threadId", thread._id)).take(100);
     for (const item of metadata) await ctx.db.delete("projectMetadata", item._id);
     for (const item of tags) await ctx.db.delete("projectTags", item._id);
-    for (const item of replies) await ctx.db.delete("replies", item._id);
+    for (const item of replies) {
+      if (await deleteReportsForTarget(ctx, item._id)) await ctx.scheduler.runAfter(0, internal.forum.cleanupReportsForTarget, { targetId: item._id });
+      await ctx.db.delete("replies", item._id);
+    }
     for (const attempt of attempts) {
       if (attempt.imageStorageId !== undefined) await deleteProjectImageIfPresent(ctx, attempt.imageStorageId);
       await ctx.db.delete("moderationAttempts", attempt._id);
     }
     if (featured !== null) await ctx.db.delete("featuredProjects", featured._id);
     if (thread.imageStorageId !== undefined) await deleteProjectImageIfPresent(ctx, thread.imageStorageId);
+    if (await deleteReportsForTarget(ctx, thread._id)) await ctx.scheduler.runAfter(0, internal.forum.cleanupReportsForTarget, { targetId: thread._id });
     await ctx.db.delete("threads", thread._id);
     if (replies.length === 100 || attempts.length === 100) {
       await ctx.scheduler.runAfter(0, internal.forum.cleanupDeletedThreadReplies, { threadId: thread._id });
@@ -1104,7 +1355,10 @@ export const cleanupDeletedThreadReplies = internalMutation({
   handler: async (ctx, args): Promise<null> => {
     const replies = await ctx.db.query("replies").withIndex("by_threadId", (q) => q.eq("threadId", args.threadId)).take(100);
     const attempts = await ctx.db.query("moderationAttempts").withIndex("by_threadId", (q) => q.eq("threadId", args.threadId)).take(100);
-    for (const item of replies) await ctx.db.delete("replies", item._id);
+    for (const item of replies) {
+      if (await deleteReportsForTarget(ctx, item._id)) await ctx.scheduler.runAfter(0, internal.forum.cleanupReportsForTarget, { targetId: item._id });
+      await ctx.db.delete("replies", item._id);
+    }
     for (const attempt of attempts) {
       if (attempt.imageStorageId !== undefined) await deleteProjectImageIfPresent(ctx, attempt.imageStorageId);
       await ctx.db.delete("moderationAttempts", attempt._id);
@@ -1176,6 +1430,105 @@ export const moderate = mutation({
       targetId = replyDoc._id;
     }
     await ctx.db.insert("moderationLog", { moderatorId: userId, targetType: args.targetType, targetId, action: args.action, reason });
+    return null;
+  },
+});
+
+export const createReport = mutation({
+  args: {
+    targetType: v.union(v.literal("thread"), v.literal("reply")),
+    threadId: v.optional(v.id("threads")),
+    replyId: v.optional(v.id("replies")),
+    reason: v.string(),
+  },
+  returns: v.id("reports"),
+  handler: async (ctx, args) => {
+    const { userId } = await requireMember(ctx);
+    const reason = args.reason.trim().slice(0, 500);
+    if (reason.length < 3) throw new Error("Add a short reason for the report.");
+    let targetId: string;
+    if (args.targetType === "thread") {
+      if (args.threadId === undefined) throw new Error("Missing thread.");
+      const thread = await ctx.db.get("threads", args.threadId);
+      if (thread === null || thread.hiddenAt !== undefined || thread.status !== "published" || !isSafetyApproved(thread.moderationStatus)) throw new Error("Thread not found.");
+      targetId = thread._id;
+    } else {
+      if (args.replyId === undefined) throw new Error("Missing reply.");
+      const replyDoc = await ctx.db.get("replies", args.replyId);
+      if (replyDoc === null || replyDoc.hiddenAt !== undefined || !isSafetyApproved(replyDoc.moderationStatus)) throw new Error("Reply not found.");
+      targetId = replyDoc._id;
+    }
+    const previous = await ctx.db
+      .query("reports")
+      .withIndex("by_reporterId_and_targetId", (q) => q.eq("reporterId", userId).eq("targetId", targetId))
+      .order("desc")
+      .first();
+    if (previous?.status === "open") throw new Error("You have already reported this item.");
+    return await ctx.db.insert("reports", { reporterId: userId, targetType: args.targetType, targetId, reason, status: "open" });
+  },
+});
+
+export const listOpenReports = query({
+  args: { limit: v.optional(v.number()) },
+  returns: v.array(openReportResultValidator),
+  handler: async (ctx, args) => {
+    const userId = await getCurrentUserId(ctx);
+    if (userId === null) return [];
+    const profile = await getProfile(ctx, userId);
+    if (profile?.role !== "moderator") return [];
+    const reports = await ctx.db.query("reports").withIndex("by_status", (q) => q.eq("status", "open")).order("asc").take(Math.max(1, Math.min(args.limit ?? 50, 100)));
+    return await Promise.all(reports.map(async (report) => {
+      const reporter = await getProfile(ctx, report.reporterId);
+      let context = "Content no longer exists";
+      let threadId: Id<"threads"> | null = null;
+      if (report.targetType === "thread") {
+        const thread = await ctx.db.get("threads", report.targetId as Id<"threads">);
+        if (thread !== null) {
+          context = thread.title;
+          threadId = thread._id;
+        }
+      } else {
+        const replyDoc = await ctx.db.get("replies", report.targetId as Id<"replies">);
+        if (replyDoc !== null) {
+          context = replyDoc.body.slice(0, 160);
+          threadId = replyDoc.threadId;
+        }
+      }
+      return {
+        _id: report._id,
+        _creationTime: report._creationTime,
+        reporterId: report.reporterId,
+        targetType: report.targetType,
+        targetId: report.targetId,
+        reason: report.reason,
+        status: "open" as const,
+        reporterHandle: reporter?.handle ?? "unknown",
+        context,
+        threadId,
+      };
+    }));
+  },
+});
+
+export const resolveReport = mutation({
+  args: { reportId: v.id("reports") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await requireModerator(ctx);
+    const report = await ctx.db.get("reports", args.reportId);
+    if (report === null) throw new Error("Report not found.");
+    await ctx.db.delete("reports", report._id);
+    return null;
+  },
+});
+
+export const cleanupReportsForTarget = internalMutation({
+  args: { targetId: v.string() },
+  returns: v.null(),
+  handler: async (ctx, args): Promise<null> => {
+    if (await deleteReportsForTarget(ctx, args.targetId)) {
+      await ctx.scheduler.runAfter(0, internal.forum.cleanupReportsForTarget, args);
+    }
     return null;
   },
 });
